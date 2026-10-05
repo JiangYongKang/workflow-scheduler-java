@@ -39,6 +39,9 @@ public class Job {
     /** 失败重试策略。 */
     private RetryPolicy retryPolicy = new RetryPolicy();
 
+    /** 单次执行的最长耗时（ms）；<=0 表示不限制（默认行为不变）。仅统计 RUNNING 期间。 */
+    private long timeoutMillis = 0L;
+
     /** 当前状态。 */
     private JobState state = JobState.PENDING;
 
@@ -104,6 +107,9 @@ public class Job {
 
     public RetryPolicy getRetryPolicy() { return retryPolicy; }
     public void setRetryPolicy(RetryPolicy retryPolicy) { this.retryPolicy = retryPolicy; }
+
+    public long getTimeoutMillis() { return timeoutMillis; }
+    public void setTimeoutMillis(long timeoutMillis) { this.timeoutMillis = timeoutMillis; }
 
     public JobState getState() { return state; }
     public void setState(JobState state) { this.state = state; }

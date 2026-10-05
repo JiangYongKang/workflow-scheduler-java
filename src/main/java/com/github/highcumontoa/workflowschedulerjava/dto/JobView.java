@@ -15,6 +15,7 @@ public class JobView {
     private String taskType;
     private int attempts;
     private int maxAttempts;
+    private long timeoutMillis;
     private String failureReason;
     private String blockedBy;
     private String detail;
@@ -33,6 +34,7 @@ public class JobView {
         v.taskType = job.getTaskType();
         v.attempts = job.getAttempts();
         v.maxAttempts = job.getRetryPolicy().getMaxAttempts();
+        v.timeoutMillis = job.getTimeoutMillis();
         v.failureReason = job.getFailureReason();
         v.blockedBy = job.getBlockedBy();
         v.detail = job.getDetail();
@@ -51,6 +53,7 @@ public class JobView {
     public String getTaskType() { return taskType; }
     public int getAttempts() { return attempts; }
     public int getMaxAttempts() { return maxAttempts; }
+    public long getTimeoutMillis() { return timeoutMillis; }
     public String getFailureReason() { return failureReason; }
     public String getBlockedBy() { return blockedBy; }
     public String getDetail() { return detail; }

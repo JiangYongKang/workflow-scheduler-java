@@ -13,8 +13,13 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.TestPropertySource;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -26,14 +31,31 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * 端到端 HTTP：提交/查询/取消，以及各类准入拒绝的可区分 code。
  * 每个类用独立 store 目录，避免历史数据干扰。
+ *
+ * <p>store 目录每次运行新建（系统临时目录），保证同一台机器上反复执行结果一致，
+ * 不受上一次运行遗留数据影响。</p>
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestPropertySource(properties = {
-        "scheduler.store-dir=target/test-data/api-1790139400",
         "scheduler.global-concurrency=2",
         "scheduler.tick-millis=10"
 })
 class JobApiTest {
+
+    private static final Path STORE_DIR = createStoreDir();
+
+    private static Path createStoreDir() {
+        try {
+            return Files.createTempDirectory("scheduler-api-test-");
+        } catch (IOException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
+    @DynamicPropertySource
+    static void storeDir(DynamicPropertyRegistry registry) {
+        registry.add("scheduler.store-dir", STORE_DIR::toString);
+    }
 
     @LocalServerPort
     int port;

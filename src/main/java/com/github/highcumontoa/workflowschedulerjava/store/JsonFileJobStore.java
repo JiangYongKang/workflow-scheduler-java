@@ -2,6 +2,7 @@ package com.github.highcumontoa.workflowschedulerjava.store;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.highcumontoa.workflowschedulerjava.model.AttemptRecord;
 import com.github.highcumontoa.workflowschedulerjava.model.Job;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -27,8 +28,10 @@ public class JsonFileJobStore implements JobStore {
     private static final Logger log = LoggerFactory.getLogger(JsonFileJobStore.class);
 
     private final Path file;
+    private final Path attemptsFile;
     private final ObjectMapper mapper;
     private final java.util.Map<String, Job> cache = new java.util.HashMap<>();
+    private final List<AttemptRecord> attempts = new ArrayList<>();
 
     public JsonFileJobStore(Path dir, ObjectMapper mapper) {
         try {
@@ -37,6 +40,7 @@ public class JsonFileJobStore implements JobStore {
             throw new UncheckedIOException("无法创建存储目录: " + dir, e);
         }
         this.file = dir.resolve("jobs.json");
+        this.attemptsFile = dir.resolve("attempts.json");
         this.mapper = mapper;
     }
 
@@ -89,6 +93,56 @@ public class JsonFileJobStore implements JobStore {
             Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } catch (IOException e) {
             throw new UncheckedIOException("持久化失败: " + file, e);
+        }
+    }
+
+    /* ===================== 执行记录 ===================== */
+
+    @Override
+    public synchronized void appendAttempt(AttemptRecord record) {
+        Objects.requireNonNull(record.getJobId(), "job id");
+        attempts.add(record);
+        persistAttempts();
+    }
+
+    @Override
+    public synchronized List<AttemptRecord> loadAttempts() {
+        attempts.clear();
+        if (!Files.exists(attemptsFile)) {
+            log.info("执行记录文件不存在，按空记录启动: {}", attemptsFile);
+            return new ArrayList<>();
+        }
+        try {
+            String json = Files.readString(attemptsFile, StandardCharsets.UTF_8);
+            if (json.isBlank()) {
+                return new ArrayList<>();
+            }
+            List<AttemptRecord> loaded = mapper.readValue(json, new TypeReference<List<AttemptRecord>>() {
+            });
+            attempts.addAll(loaded);
+            log.info("从 {} 恢复执行记录 {} 条", attemptsFile, loaded.size());
+            return new ArrayList<>(attempts);
+        } catch (IOException e) {
+            throw new UncheckedIOException("读取执行记录文件失败: " + attemptsFile, e);
+        }
+    }
+
+    @Override
+    public synchronized List<AttemptRecord> attemptsOf(String jobId) {
+        return attempts.stream()
+                .filter(r -> r.getJobId().equals(jobId))
+                .sorted(java.util.Comparator.comparingInt(AttemptRecord::getAttempt))
+                .toList();
+    }
+
+    private void persistAttempts() {
+        try {
+            Path tmp = attemptsFile.resolveSibling("attempts.json.tmp");
+            String json = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(attempts);
+            Files.writeString(tmp, json, StandardCharsets.UTF_8);
+            Files.move(tmp, attemptsFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            throw new UncheckedIOException("执行记录持久化失败: " + attemptsFile, e);
         }
     }
 }

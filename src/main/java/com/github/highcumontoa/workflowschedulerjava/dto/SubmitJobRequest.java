@@ -16,6 +16,7 @@ public class SubmitJobRequest {
     private List<String> dependencies;
     private String taskType;
     private Long taskParam;
+    private Long timeoutMillis;
     private RetryPolicy retryPolicy;
 
     public String getId() { return id; }
@@ -41,6 +42,9 @@ public class SubmitJobRequest {
 
     public Long getTaskParam() { return taskParam; }
     public void setTaskParam(Long taskParam) { this.taskParam = taskParam; }
+
+    public Long getTimeoutMillis() { return timeoutMillis; }
+    public void setTimeoutMillis(Long timeoutMillis) { this.timeoutMillis = timeoutMillis; }
 
     public RetryPolicy getRetryPolicy() { return retryPolicy; }
     public void setRetryPolicy(RetryPolicy retryPolicy) { this.retryPolicy = retryPolicy; }
