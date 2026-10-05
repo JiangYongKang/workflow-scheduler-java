@@ -16,6 +16,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.TestPropertySource;
 
 import java.time.Duration;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
@@ -25,7 +26,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 端到端 HTTP：提交/查询/取消，以及各类准入拒绝的可区分 code。
- * 每个类用独立 store 目录，避免历史数据干扰。
+ * 每个类用独立 store 目录；静态初始化在 Spring 上下文启动前清理历史数据，
+ * 保证同一台机器反复执行结果一致。
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestPropertySource(properties = {
@@ -34,6 +36,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
         "scheduler.tick-millis=10"
 })
 class JobApiTest {
+
+    static {
+        // 类加载即清理（早于 Spring 上下文创建），避免上一轮运行遗留的 jobs.json 干扰
+        EngineTestSupport.deleteRecursively(Path.of("target/test-data/api-1790139400"));
+    }
 
     @LocalServerPort
     int port;

@@ -2,6 +2,7 @@ package com.github.highcumontoa.workflowschedulerjava.web;
 
 import com.github.highcumontoa.workflowschedulerjava.dto.*;
 import com.github.highcumontoa.workflowschedulerjava.engine.SchedulerEngine;
+import com.github.highcumontoa.workflowschedulerjava.model.AttemptRecord;
 import java.util.List;
 import org.springframework.web.bind.annotation.*;
 
@@ -34,5 +35,10 @@ public class JobController {
     @PostMapping("/{id}/cancel")
     public JobView cancel(@PathVariable String id) {
         return engine.cancel(id);
+    }
+
+    @GetMapping("/{id}/attempts")
+    public List<AttemptRecord> attempts(@PathVariable String id) {
+        return engine.listAttempts(id);
     }
 }

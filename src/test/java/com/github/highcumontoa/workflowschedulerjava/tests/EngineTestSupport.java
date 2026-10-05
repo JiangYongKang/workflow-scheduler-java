@@ -38,6 +38,25 @@ final class EngineTestSupport {
         return new SchedulerEngine(store, new InProcessTaskHandler(), p);
     }
 
+    /** 递归删除目录（存在才删），用于 Spring 测试在上下文启动前清理历史持久化数据。 */
+    static void deleteRecursively(Path dir) {
+        if (!java.nio.file.Files.exists(dir)) {
+            return;
+        }
+        try (var walk = java.nio.file.Files.walk(dir)) {
+            walk.sorted(java.util.Comparator.reverseOrder())
+                    .forEach(p -> {
+                        try {
+                            java.nio.file.Files.delete(p);
+                        } catch (java.io.IOException e) {
+                            throw new RuntimeException("清理测试目录失败: " + p, e);
+                        }
+                    });
+        } catch (java.io.IOException e) {
+            throw new RuntimeException("清理测试目录失败: " + dir, e);
+        }
+    }
+
     static JobView awaitState(SchedulerEngine engine, String id, JobState expected, Duration timeout) {
         long deadline = System.currentTimeMillis() + timeout.toMillis();
         JobView view = null;
