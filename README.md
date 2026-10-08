@@ -8,7 +8,7 @@ JSON 文件持久化的进程重启恢复。
 
 ```bash
 mvn spring-boot:run            # 启动，默认 http://localhost:8080
-mvn test                       # 运行全部测试（44 个用例）
+mvn test                       # 运行全部测试（52 个用例）
 ```
 
 持久化目录默认 `data/scheduler/`（`jobs.json` / `attempts.json` / `meta.json`），可用配置项覆盖。
@@ -159,17 +159,40 @@ PENDING ──获得配额──► RUNNING ──成功────────
   FAILED 并传播 UNREACHABLE）。
 - 超时判定生效时**立即释放该作业占用的全局/队列/租户并发名额**，排队作业在下一个
   tick 即可补位，不必等卡住的任务自己结束。
-- 竞争的确定性规则（都在调度锁内串行判定，同一作业不会出现“一会儿成功一会儿失败”）：
-  1. 取消请求优先于超时（与“取消 vs 成功”一致）；
+- **超时是“判定”而不是“杀死任务”**：调度器会向执行线程发送协作中断信号
+  （`Future.cancel(true)` / `Thread.interrupt`），但任务本身可能对取消不敏感、继续
+  跑完。此时必须遵守“结果按尝试归属”规则（见下），迟到结果不会污染后续尝试。
+
+### 9.1 迟到结果的归属规则（结果严格属于它自己那一次尝试）
+
+- 每次执行在工作线程内回送结果时都携带**作业 id + 尝试序号**；调度线程只在
+  “作业当前仍处于该序号的 RUNNING”时才采纳结果。
+- 典型时序：第 n 次尝试在 t1 被判超时（名额立即归还、作业进入重试），但任务没有
+  真正停下来，在 t2（第 n+1 次尝试已在运行）才返回成功/失败。该迟到结果会被
+  **直接丢弃并打 WARN 日志**：
+  - 不会把第 n+1 次尝试顶替成 SUCCESS / 提前打成 FAILED；
+  - 不会从运行账本中摘掉第 n+1 次的 Future，因此**名额不会被重复归还**，不会牵连
+    其它作业或其它尝试；
+  - 第 n 次尝试的执行记录在超时判定时已定格为 `TIMEOUT`，迟到结果不会再改写它。
+- 同一作业的“超时 / 自己跑完 / 被取消”都在调度锁内串行判定，终态唯一、可解释：
+  1. 取消请求优先于超时，也优先于成功（与“取消 vs 成功”一致），取消与超时同时
+     发生时终态恒为 CANCELLED；
   2. 执行结果已回送并处理（状态已迁移）后，超时判定为空操作；
-  3. 超时先生效时，迟到的执行结果会因状态已非 RUNNING 被丢弃并打 WARN 日志。
+  3. 超时先生效时，迟到的执行结果因“尝试序号对不上”被丢弃。
 - **未配置 `timeoutMillis` 的作业行为与旧版完全一致**（不限制执行时长）。
+
+### 9.2 停机后的后台静默保证
+
+- 调度器停止（`@PreDestroy` / `stop()`）后：调度循环退出、超时定时器与工作线程池
+  立即关闭；此后即使有任务对中断不敏感、稍后才跑完，其结果也**不再回送、不迁移
+  任何状态、不回填执行记录、不写盘**。反复启停不会冒出偶发报错或两遍结果对不上。
 
 ## 10. 暂停与恢复
 
-- `POST /api/scheduler/pause` 后：调度器**不再启动任何新执行**；已在 RUNNING 的作业
-  自然跑完并正常走成功/失败/重试逻辑；PENDING/QUEUED 作业**原样保留**——不丢弃、
-  不判失败、不计超时（超时只对 RUNNING 计时）。
+- `POST /api/scheduler/pause` 后：调度器**不再启动任何新执行**，也**不启动新的超时
+  判定定时器**；已在 RUNNING 的作业自然跑完并正常走成功/失败/重试逻辑（已开始计时的
+  超时仍按第 9 节规则判定）；PENDING/QUEUED 作业**原样保留**——不丢弃、不判失败、
+  不计超时（超时只对 RUNNING 计时）。
 - `POST /api/scheduler/resume` 后：保留的作业按原有的依赖关系与三道配额规则继续
   推进，语义与未暂停过一致。
 - 开关状态持久化在 `<store-dir>/meta.json`：**进程重启后暂停状态保持**，重启恢复
@@ -181,13 +204,14 @@ PENDING ──获得配额──► RUNNING ──成功────────
 - 每次真实进入 RUNNING 都追加一条记录（先落盘后执行），字段：`jobId`、`attempt`
   （第几次尝试）、`startedAt`、`finishedAt`、`result`、`error`。
 - `result` 取值：`SUCCESS` / `FAILED`（含重试中的失败）/ `CANCELLED` / `TIMEOUT` /
-  `INTERRUPTED`（进程重启时发现该次执行未留下结果，恢复时收尾）/ `STARTED`
-  （执行中，尚未有结果）。
+  `INTERRUPTED`（进程重启时发现该次执行未留下结果，恢复时收尾；**已经落下终态的记录
+  如 TIMEOUT 不会在重启时被改写**）/ `STARTED`（执行中，尚未有结果）。
 - 查询：`GET /api/jobs/{id}/attempts`，按尝试序号升序返回；作业不存在返回 404。
 - 记录持久化在 `<store-dir>/attempts.json`（临时文件 + 原子 move），**进程重启不丢**。
 - 条数语义：**记录条数恒等于真实进入 RUNNING 的次数**。重试、重启后重跑、被取消的
-  执行各算一条；幂等命中、排队等待、执行前被取消、UNREACHABLE 的作业不产生记录；
-  重启与重复提交都不会让记录凭空增多或减少（见 `AttemptRecordTest`、
+  执行各算一条；一次尝试的结果只写它自己那条记录（迟到结果绝不会覆盖别的尝试）；
+  幂等命中、排队等待、执行前被取消、UNREACHABLE 的作业不产生记录；重启与重复提交
+  都不会让记录凭空增多或减少（见 `AttemptRecordTest`、`TimeoutRetryRaceTest`、
   `ProcessRestartTest`）。
 
 ## 12. 配置项（`application.properties`，前缀 `scheduler`）
@@ -228,10 +252,11 @@ mvn test
 | `ConcurrencyRaceTest` | 30 作业并发提交不超配额不丢失；8 线程并发取消收敛到单一终态 |
 | `JobApiTest` | HTTP 端到端提交 / 查询 / 取消与全部准入错误码 |
 | `TimeoutTest` | 超时按失败处理并重试、名额立即释放、排队不耗超时预算、取消优先于超时、未配置超时行为不变 |
+| `TimeoutRetryRaceTest` | 迟到成功/失败不跨尝试、超时与完成撞车、超时与取消 20 轮撞车收敛唯一、连续超时耗尽传播、名额只归还一次、停机后迟到结果静默 |
 | `PauseResumeTest` | 暂停不启新执行、运行中自然跑完、排队不丢、暂停状态跨重启保持、恢复后依赖与配额照常 |
 | `AttemptRecordTest` | 每次执行一条记录且按序可查、取消/未执行的记录语义、重启不丢且不多不少 |
 | `SchedulerApiTest` | 新能力的 HTTP 端到端：执行记录查询、暂停/恢复/状态、单作业超时 |
-| `ProcessRestartTest` | 真实进程重启：RUNNING 恢复重跑且 SUCCESS 不重复、暂停跨重启保持、执行记录真实 |
+| `ProcessRestartTest` | 真实进程重启：RUNNING 恢复重跑且 SUCCESS 不重复、暂停跨重启保持、超时退避期重启记录不虚增不丢失、执行记录真实 |
 
 手工验证示例：
 
@@ -241,7 +266,7 @@ curl -s -XPOST localhost:8080/api/jobs -H 'Content-Type: application/json' \
 curl -s localhost:8080/api/jobs/b
 curl -s -XPOST localhost:8080/api/jobs/a/cancel
 
-# 超时：200ms 后按失败处理
+# 超时：200ms 后按失败处理；若任务不响应中断、稍后才跑完，迟到结果只记在自己那次尝试
 curl -s -XPOST localhost:8080/api/jobs -H 'Content-Type: application/json' \
   -d '{"jobs":[{"id":"t","taskType":"sleep","taskParam":5000,"timeoutMillis":200}]}'
 curl -s localhost:8080/api/jobs/t/attempts

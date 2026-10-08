@@ -131,6 +131,32 @@ class ProcessRestartTest {
     }
 
     @Test
+    void timedOutRetryStateSurvivesRealKillWithoutRecordInflation(@TempDir Path dir) throws Exception {
+        // 第一个进程：作业第 1 次执行超时（TIMEOUT 已落盘），正处于重试退避时被真实杀掉
+        Proc first = spawn(dir, "run-timeout");
+        first.awaitLine("READY", Duration.ofSeconds(30));
+        first.killForcibly();
+
+        // 第二个进程：恢复后第 2 次（末次）尝试同样超时 -> FAILED；
+        // 执行记录必须恰好 2 条（第 1 次 TIMEOUT 原样保留 + 重启后第 2 次 TIMEOUT），不虚增不丢失
+        Proc second = spawn(dir, "verify-timeout");
+        List<String> out = second.awaitDoneAndCollect(Duration.ofSeconds(60));
+
+        Map<String, String> jobs = jobStates(out);
+        log.info("[真实重启判定] 超时重试恢复后作业状态: {}", jobs);
+        assertEquals("FAILED/2", jobs.get("slow-timeout"),
+                "重启后耗尽剩余重试预算，终态 FAILED 且只真实执行过 2 次");
+
+        List<String> attempts = attemptLines(out, "slow-timeout");
+        log.info("[真实重启判定] slow-timeout 执行记录: {}", attempts);
+        assertEquals(2, attempts.size(), "记录条数必须等于真实尝试次数，重启不虚增不丢失");
+        assertTrue(attempts.get(0).contains("attempt=1") && attempts.get(0).contains("result=TIMEOUT"),
+                "被杀前已判定的第 1 次 TIMEOUT 必须原样保留: " + attempts.get(0));
+        assertTrue(attempts.get(1).contains("attempt=2") && attempts.get(1).contains("result=TIMEOUT"),
+                "重启后的第 2 次尝试应正常计时并超时: " + attempts.get(1));
+    }
+
+    @Test
     void pauseSurvivesRealKillAndResumeContinues(@TempDir Path dir) throws Exception {
         // 第一个进程：暂停调度器并提交 held，随后被真实杀掉
         Proc first = spawn(dir, "run-paused");

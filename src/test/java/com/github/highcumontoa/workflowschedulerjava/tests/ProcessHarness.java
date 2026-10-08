@@ -42,8 +42,10 @@ public final class ProcessHarness {
         switch (mode) {
             case "run" -> run(dir, false);
             case "run-paused" -> run(dir, true);
+            case "run-timeout" -> runTimeoutRetry(dir);
             case "verify" -> verify(dir);
             case "verify-resume" -> verifyResume(dir);
+            case "verify-timeout" -> verifyTimeoutRetry(dir);
             default -> throw new IllegalArgumentException("未知模式: " + mode);
         }
     }
@@ -67,6 +69,58 @@ public final class ProcessHarness {
         r.setTaskType(type);
         r.setTaskParam(param);
         return r;
+    }
+
+    /** 超时重试场景：slow 300ms 超时、最多 2 次、退避 5000ms（保证被杀时仍在退避，不会启动第 2 次）。 */
+    private static SubmitJobRequest timeoutRetryJob() {
+        SubmitJobRequest r = job("slow-timeout", "sleep", 30_000);
+        r.setTimeoutMillis(300L);
+        r.setRetryPolicy(new com.github.highcumontoa.workflowschedulerjava.model.RetryPolicy(2, 5000));
+        return r;
+    }
+
+    private static void runTimeoutRetry(Path dir) throws Exception {
+        SchedulerEngine e = newEngine(dir);
+        submit(e, timeoutRetryJob());
+        // 等第 1 次执行被判超时：作业回到 PENDING 且 attempts=1（进入 5s 退避，尚未启动第 2 次）
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+            JobView v = e.get("slow-timeout");
+            if ("PENDING".equals(v.getState()) && v.getAttempts() >= 1) {
+                break;
+            }
+            Thread.sleep(20);
+        }
+        JobView v = e.get("slow-timeout");
+        if (!("PENDING".equals(v.getState()) && v.getAttempts() >= 1)) {
+            throw new IllegalStateException("超时重试场景未按预期进入退避: state="
+                    + v.getState() + " attempts=" + v.getAttempts());
+        }
+        // 确认 TIMEOUT 记录已落盘后再等被杀（期间仍处于 5s 退避，第 2 次不会启动）
+        deadline = System.currentTimeMillis() + 3000;
+        while (System.currentTimeMillis() < deadline) {
+            List<AttemptRecord> recs = e.listAttempts("slow-timeout");
+            if (recs.size() == 1 && recs.get(0).getResult()
+                    == com.github.highcumontoa.workflowschedulerjava.model.AttemptResult.TIMEOUT) {
+                break;
+            }
+            Thread.sleep(20);
+        }
+        System.out.println("ATTEMPTS " + e.get("slow-timeout").getAttempts());
+        System.out.println("READY");
+        Thread.sleep(Duration.ofHours(1).toMillis());
+    }
+
+    private static void verifyTimeoutRetry(Path dir) throws Exception {
+        SchedulerEngine e = newEngine(dir);
+        try {
+            // 重启后第 2 次（最后一次）尝试同样会超时 -> FAILED；两次真实尝试，记录 2 条
+            await(e, "slow-timeout", "FAILED", Duration.ofSeconds(20));
+            printAll(e, List.of("slow-timeout"));
+        } finally {
+            e.stop();
+        }
+        System.out.println("DONE");
     }
 
     private static void submit(SchedulerEngine e, SubmitJobRequest... jobs) {

@@ -59,14 +59,24 @@ public class SchedulerEngine {
     private final Map<String, String> idempotencyIndex = new HashMap<>();
     /** 下游索引：jobId -> 直接下游。 */
     private final Map<String, List<String>> downstream = new HashMap<>();
-    /** 正在执行的作业（锁外运行）。 */
-    private final Map<String, Future<?>> running = new HashMap<>();
+    /**
+     * 正在执行的运行槽位：记录该槽位属于哪一次尝试及其 Future。
+     * 槽位与尝试一一对应——超时判定释放的是旧槽位，新尝试持有的是新槽位，
+     * 迟到结果只能碰到旧槽位，绝不可能摘掉正在运行的那次尝试所占的名额。
+     */
+    private record RunningSlot(int attempt, Future<?> future) {
+    }
+
+    /** 正在执行的作业（锁外运行）：jobId -> 当前占着运行名额的槽位。 */
+    private final Map<String, RunningSlot> running = new HashMap<>();
     /** 待重试就绪时间：jobId -> epoch ms。 */
     private final Map<String, Long> retryAfter = new HashMap<>();
 
     private final LinkedBlockingQueue<Outcome> outcomes = new LinkedBlockingQueue<>();
 
     private Thread schedulerThread;
+    /** 调度器是否处于活跃（start 后、stop 前）状态。停机后一切后台回调都必须是空操作。 */
+    private volatile boolean active;
     private volatile boolean runningFlag;
     /** 暂停开关：为 true 时不再启动新执行，运行中的作业自然跑完，排队作业保留。持久化到 meta。 */
     private volatile boolean paused;
@@ -99,6 +109,7 @@ public class SchedulerEngine {
             return t;
         });
         recover();
+        active = true;
         runningFlag = true;
         schedulerThread = new Thread(this::loop, "scheduler-loop");
         schedulerThread.setDaemon(true);
@@ -108,14 +119,17 @@ public class SchedulerEngine {
 
     @PreDestroy
     public void stop() {
+        // 先关掉活跃开关：此后工作线程迟到的结果、超时定时器的触发都不会再进入
+        // 锁内做状态迁移或写盘，保证停机后无任何后台活动推进状态。
+        active = false;
         runningFlag = false;
         if (schedulerThread != null) {
             schedulerThread.interrupt();
         }
-        workers.shutdownNow();
         if (timeoutScheduler != null) {
             timeoutScheduler.shutdownNow();
         }
+        workers.shutdownNow();
         try {
             workers.awaitTermination(2, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
@@ -354,9 +368,9 @@ public class SchedulerEngine {
                 }
                 case RUNNING -> {
                     job.setCancelRequested(true);
-                    Future<?> f = running.get(id);
-                    if (f != null) {
-                        f.cancel(true);
+                    RunningSlot slot = running.get(id);
+                    if (slot != null) {
+                        slot.future().cancel(true);
                     }
                     job.setDetail("收到取消请求，正在协作中断执行");
                     store.put(job);
@@ -522,8 +536,8 @@ public class SchedulerEngine {
             if (job.getState() != JobState.RUNNING || !job.isCancelRequested()) {
                 continue;
             }
-            Future<?> f = running.get(job.getId());
-            if (f != null && f.isDone()) {
+            RunningSlot slot = running.get(job.getId());
+            if (slot != null && slot.future().isDone()) {
                 running.remove(job.getId());
                 completeAttempt(job, AttemptResult.CANCELLED, "取消请求生效，执行未产生结果");
                 transition(job, JobState.CANCELLED, null,
@@ -571,15 +585,24 @@ public class SchedulerEngine {
         log.info("job={} 状态迁移 ->RUNNING 第 {} 次执行 queue={} tenant={}",
                 job.getId(), attempt, job.getQueue(), job.getTenant());
         Job live = job;
-        Future<?> future = workers.submit(() -> runAttempt(live));
-        running.put(job.getId(), future);
-        Long timeout = job.getTimeoutMillis();
+        final int launchedAttempt = attempt;
+        Future<?> future = workers.submit(() -> runAttempt(live, launchedAttempt));
+        running.put(job.getId(), new RunningSlot(launchedAttempt, future));
+        Long timeout = timeoutForAttempt(job, attempt);
         if (timeout != null && timeout > 0) {
             // 仅对 RUNNING 期间计时：排队与重试退避不消耗该预算
-            final int launchedAttempt = attempt;
             timeoutScheduler.schedule(() -> onTimeout(job.getId(), launchedAttempt),
                     timeout, TimeUnit.MILLISECONDS);
         }
+    }
+
+    /**
+     * 某次尝试生效的超时预算（毫秒）。默认每次尝试都使用作业配置的
+     * {@link Job#getTimeoutMillis()}（null/&lt;=0 表示不限制，行为与旧版一致）；
+     * 声明为 protected 以便测试覆盖出“只有第 1 次短超时、后续尝试窗口更宽”的场景。
+     */
+    protected Long timeoutForAttempt(Job job, int attempt) {
+        return job.getTimeoutMillis();
     }
 
     /**
@@ -590,14 +613,25 @@ public class SchedulerEngine {
      * 同一作业不会出现“一会儿成功一会儿失败”。</p>
      */
     private void onTimeout(String jobId, int attempt) {
+        if (!active) {
+            return;
+        }
         synchronized (lock) {
+            if (!active) {
+                return;
+            }
             Job job = jobs.get(jobId);
             if (job == null || job.getState() != JobState.RUNNING || job.getAttempts() != attempt) {
                 return;
             }
-            Future<?> f = running.remove(jobId);
-            if (f != null) {
-                f.cancel(true);
+            RunningSlot slot = running.remove(jobId);
+            // 只摘除确实属于“这次超时尝试”的槽位（理论上一定匹配，这里再做一次防御）
+            if (slot != null && slot.attempt() != attempt) {
+                running.put(jobId, slot);
+                return;
+            }
+            if (slot != null) {
+                slot.future().cancel(true);
             }
             String error = "TimeoutException: 第 " + attempt + " 次执行超过最长执行时间 "
                     + job.getTimeoutMillis() + " ms";
@@ -615,7 +649,7 @@ public class SchedulerEngine {
         }
     }
 
-    private void runAttempt(Job live) {
+    private void runAttempt(Job live, int attempt) {
         String id = live.getId();
         boolean ok = false;
         String error = null;
@@ -625,7 +659,13 @@ public class SchedulerEngine {
         } catch (Throwable t) {
             error = t.getClass().getSimpleName() + ": " + t.getMessage();
         }
-        outcomes.add(new Outcome(id, ok, error, Thread.currentThread().isInterrupted()));
+        // 停机后任务才结束（例如任务对中断不敏感）：结果直接丢弃，绝不回送、绝不改状态
+        if (!active) {
+            log.info("job={} 第 {} 次尝试在调度器停机后才结束，结果不回送、不迁移状态", id, attempt);
+            return;
+        }
+        // 结果必须带上它所属的尝试序号：迟到结果只允许对自己那一次生效
+        outcomes.add(new Outcome(id, attempt, ok, error, Thread.currentThread().isInterrupted()));
     }
 
     private void handleOutcome(Outcome o) {
@@ -634,10 +674,23 @@ public class SchedulerEngine {
             running.remove(o.jobId());
             return;
         }
-        // 仅当仍是 RUNNING 才采纳结果（防御过期任务）
-        if (job.getState() != JobState.RUNNING) {
-            running.remove(o.jobId());
-            log.warn("job={} 结果被丢弃：当前状态 {} 非 RUNNING", o.jobId(), job.getState());
+        // 尝试归属判定：结果只对“它自己那一次尝试”生效。
+        // 典型场景：第 n 次被判超时后任务并未真正停下，稍后才回送结果；此时第 n+1 次
+        // 可能正在运行。迟到结果既不能顶替第 n+1 次的结果，也不能摘掉它占着的运行名额。
+        RunningSlot slot = running.get(o.jobId());
+        boolean sameAttempt = job.getState() == JobState.RUNNING
+                && slot != null && slot.attempt() == o.attempt()
+                && job.getAttempts() == o.attempt();
+        if (!sameAttempt) {
+            // 只有账本里挂着的槽位正是产生该迟到结果的旧执行时才摘除；槽位已被超时
+            // 判定摘走（常见）或已属于更新的尝试时，这里什么都不动——名额绝不重复归还。
+            if (slot != null && slot.attempt() == o.attempt()) {
+                running.remove(o.jobId(), slot);
+            }
+            log.warn("job={} 第 {} 次尝试的迟到结果被丢弃（当前 state={}, attempts={}, 占用槽位={}），"
+                            + "不迁移状态、不释放名额、不影响其它尝试",
+                    o.jobId(), o.attempt(), job.getState(), job.getAttempts(),
+                    slot == null ? "无（名额已在超时判定时归还）" : ("第 " + slot.attempt() + " 次"));
             return;
         }
         running.remove(o.jobId());
@@ -699,10 +752,12 @@ public class SchedulerEngine {
         store.saveAttempt(rec);
     }
 
-    /** 重启恢复时，把崩溃前未留下结果的执行记录收尾为 INTERRUPTED。 */
+    /** 重启恢复时，把崩溃前未留下结果的执行记录收尾为 INTERRUPTED（已有终态的记录原样保留）。 */
     private void closeInterruptedAttempt(Job job) {
         List<AttemptRecord> records = store.listAttempts(job.getId());
         for (AttemptRecord rec : records) {
+            // 只收尾确实“开始过但没有任何结果”的记录；TIMEOUT/SUCCESS/FAILED/CANCELLED 等
+            // 已落终态的记录必须原样保留（例如超时后在重试退避期被杀的场景）。
             if (rec.getResult() == AttemptResult.STARTED) {
                 rec.setResult(AttemptResult.INTERRUPTED);
                 rec.setFinishedAt(System.currentTimeMillis());
@@ -777,6 +832,6 @@ public class SchedulerEngine {
         }
     }
 
-    private record Outcome(String jobId, boolean success, String error, boolean interrupted) {
+    private record Outcome(String jobId, int attempt, boolean success, String error, boolean interrupted) {
     }
 }
