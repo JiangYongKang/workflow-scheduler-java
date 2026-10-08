@@ -28,6 +28,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -59,10 +60,15 @@ public class SchedulerEngine {
     private final Map<String, String> idempotencyIndex = new HashMap<>();
     /** 下游索引：jobId -> 直接下游。 */
     private final Map<String, List<String>> downstream = new HashMap<>();
-    /** 正在执行的作业（锁外运行）。 */
+    /** 正在执行的作业（锁外运行）：key 为 jobId，只保留“当前这一次尝试”的 Future。 */
     private final Map<String, Future<?>> running = new HashMap<>();
     /** 待重试就绪时间：jobId -> epoch ms。 */
     private final Map<String, Long> retryAfter = new HashMap<>();
+    /**
+     * 各作业当前这次尝试的超时计时任务：key 为 jobId。某次尝试一结束（成功/失败/取消/超时）
+     * 立即撤销其计时任务，保证上一轮的超时绝不会烧到后面的尝试，停调度器后也无残留活动。
+     */
+    private final Map<String, ScheduledFuture<?>> timeoutFutures = new HashMap<>();
 
     private final LinkedBlockingQueue<Outcome> outcomes = new LinkedBlockingQueue<>();
 
@@ -112,14 +118,24 @@ public class SchedulerEngine {
         if (schedulerThread != null) {
             schedulerThread.interrupt();
         }
-        workers.shutdownNow();
+        // 先停超时计时器并等其退出，避免调度器停止后仍有超时回调在锁内改状态
         if (timeoutScheduler != null) {
             timeoutScheduler.shutdownNow();
         }
+        workers.shutdownNow();
         try {
+            if (timeoutScheduler != null) {
+                timeoutScheduler.awaitTermination(2, TimeUnit.SECONDS);
+            }
             workers.awaitTermination(2, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+        // 停止后丢弃尚未处理的执行回送结果，杜绝后台线程继续推进状态
+        outcomes.clear();
+        synchronized (lock) {
+            timeoutFutures.clear();
+            running.clear();
         }
     }
 
@@ -131,6 +147,7 @@ public class SchedulerEngine {
             downstream.clear();
             running.clear();
             retryAfter.clear();
+            timeoutFutures.clear();
             List<Job> loaded = store.loadAll();
             int recovered = 0;
             for (Job job : loaded) {
@@ -525,6 +542,7 @@ public class SchedulerEngine {
             Future<?> f = running.get(job.getId());
             if (f != null && f.isDone()) {
                 running.remove(job.getId());
+                disarmTimeout(job.getId());
                 completeAttempt(job, AttemptResult.CANCELLED, "取消请求生效，执行未产生结果");
                 transition(job, JobState.CANCELLED, null,
                         "取消请求生效（执行线程未产生结果，调度线程兜底收尾）");
@@ -571,36 +589,55 @@ public class SchedulerEngine {
         log.info("job={} 状态迁移 ->RUNNING 第 {} 次执行 queue={} tenant={}",
                 job.getId(), attempt, job.getQueue(), job.getTenant());
         Job live = job;
-        Future<?> future = workers.submit(() -> runAttempt(live));
+        final int launchedAttempt = attempt;
+        Future<?> future = workers.submit(() -> runAttempt(live, launchedAttempt));
         running.put(job.getId(), future);
-        Long timeout = job.getTimeoutMillis();
+        Long timeout = job.getTimeoutForAttempt(attempt);
+        if (timeout == null) {
+            timeout = job.getTimeoutMillis();
+        }
         if (timeout != null && timeout > 0) {
             // 仅对 RUNNING 期间计时：排队与重试退避不消耗该预算
-            final int launchedAttempt = attempt;
-            timeoutScheduler.schedule(() -> onTimeout(job.getId(), launchedAttempt),
-                    timeout, TimeUnit.MILLISECONDS);
+            ScheduledFuture<?> t = timeoutScheduler.schedule(
+                    () -> onTimeout(job.getId(), launchedAttempt), timeout, TimeUnit.MILLISECONDS);
+            timeoutFutures.put(job.getId(), t);
         }
     }
 
     /**
-     * 超时判定（在调度锁内直接生效）：仅当作业仍处于本次尝试的 RUNNING 才按失败处理。
+     * 超时判定（在调度锁内直接生效）：仅当作业仍处于“这一次尝试”的 RUNNING 才按失败处理。
      *
      * <p>竞争规则（确定性）：取消请求优先于超时；若执行结果已回送并处理（状态已迁移），
-     * 超时判定为空操作；若结果尚未回送，超时先生效，迟到的结果会因状态非 RUNNING 被丢弃，
-     * 同一作业不会出现“一会儿成功一会儿失败”。</p>
+     * 或作业已在跑后面的另一次尝试（{@code attempts != attempt}），超时判定为空操作；
+     * 超时先生效时，这次尝试迟到的结果会在 {@link #handleOutcome} 因尝试序号不匹配被丢弃，
+     * 同一作业不会出现“一会儿成功一会儿失败”。超时生效即立即释放并发名额，迟到结果不会
+     * 再动任何账本，也不会牵连正在跑的后续尝试或别的作业。</p>
      */
     private void onTimeout(String jobId, int attempt) {
+        if (!runningFlag) {
+            // 调度器已停止：不再推进任何状态
+            return;
+        }
         synchronized (lock) {
-            Job job = jobs.get(jobId);
-            if (job == null || job.getState() != JobState.RUNNING || job.getAttempts() != attempt) {
+            if (!runningFlag) {
                 return;
             }
+            Job job = jobs.get(jobId);
+            if (job == null || job.getState() != JobState.RUNNING || job.getAttempts() != attempt) {
+                // 本次尝试已结束 / 作业已进入后续尝试：超时作废（其计时任务也会被撤销）
+                return;
+            }
+            timeoutFutures.remove(jobId);
             Future<?> f = running.remove(jobId);
             if (f != null) {
                 f.cancel(true);
             }
+            Long effectiveTimeout = job.getTimeoutForAttempt(attempt);
+            if (effectiveTimeout == null) {
+                effectiveTimeout = job.getTimeoutMillis();
+            }
             String error = "TimeoutException: 第 " + attempt + " 次执行超过最长执行时间 "
-                    + job.getTimeoutMillis() + " ms";
+                    + effectiveTimeout + " ms";
             if (job.isCancelRequested()) {
                 // 取消与超时撞车：取消请求优先，语义与“取消 vs 成功”一致
                 completeAttempt(job, AttemptResult.CANCELLED, error);
@@ -608,15 +645,18 @@ public class SchedulerEngine {
                 propagateUnreachable();
             } else {
                 log.warn("job={} 第 {} 次执行超时（{} ms），按本次失败处理并立即释放并发名额",
-                        jobId, attempt, job.getTimeoutMillis());
+                        jobId, attempt, effectiveTimeout);
                 applyFailure(job, AttemptResult.TIMEOUT, error);
             }
             lock.notifyAll();
         }
     }
 
-    private void runAttempt(Job live) {
+    private void runAttempt(Job live, int attempt) {
         String id = live.getId();
+        // 工作线程会被复用：上一次尝试（如超时后 Future.cancel(true)）留下的中断标记只属于
+        // 上一次尝试，绝不能带进新的一次执行，否则会把响应中断的任务“一进来就打断”。
+        Thread.interrupted();
         boolean ok = false;
         String error = null;
         try {
@@ -625,7 +665,7 @@ public class SchedulerEngine {
         } catch (Throwable t) {
             error = t.getClass().getSimpleName() + ": " + t.getMessage();
         }
-        outcomes.add(new Outcome(id, ok, error, Thread.currentThread().isInterrupted()));
+        outcomes.add(new Outcome(id, attempt, ok, error, Thread.currentThread().isInterrupted()));
     }
 
     private void handleOutcome(Outcome o) {
@@ -634,12 +674,17 @@ public class SchedulerEngine {
             running.remove(o.jobId());
             return;
         }
-        // 仅当仍是 RUNNING 才采纳结果（防御过期任务）
-        if (job.getState() != JobState.RUNNING) {
-            running.remove(o.jobId());
-            log.warn("job={} 结果被丢弃：当前状态 {} 非 RUNNING", o.jobId(), job.getState());
+        // 结果必须同时匹配“当前 RUNNING 的这一次尝试”才采纳：
+        //  1) 作业已离开 RUNNING（成功/失败/取消/超时已先生效）——结果迟到，丢弃；
+        //  2) 尝试序号不匹配——这是前几次尝试里那个对取消不敏感、自己跑完的旧任务迟到了，
+        //     绝不能算到后面正在跑的尝试头上，也不能摘掉当前尝试的 Future / 重复释放名额。
+        // 两种情况都只丢弃结果本身并记录 WARN，不动任何账本。
+        if (job.getState() != JobState.RUNNING || job.getAttempts() != o.attempt()) {
+            log.warn("job={} 第 {} 次尝试的迟到结果被丢弃（当前 state={}, 当前尝试={}），不影响当前执行与配额",
+                    o.jobId(), o.attempt(), job.getState(), job.getAttempts());
             return;
         }
+        disarmTimeout(job.getId());
         running.remove(o.jobId());
         if (o.success()) {
             if (job.isCancelRequested()) {
@@ -777,6 +822,38 @@ public class SchedulerEngine {
         }
     }
 
-    private record Outcome(String jobId, boolean success, String error, boolean interrupted) {
+    /**
+     * 测试辅助：所有能推进/修改调度状态的后台活动是否都已停止（调度循环退出、超时计时器终止、
+     * 工作池已 shutdown）。注意 1：对中断不敏感的用户任务可能仍占着工作线程无法物理终止
+     * （JVM 不支持安全强杀线程），但消费结果的调度循环已经退出，其回送不可能再推进任何状态，
+     * 且这些工作线程是 daemon、不影响 JVM 退出。注意 2：stop 会清空待处理结果，但僵尸用户
+     * 线程在 stop 之后仍可能向队列尾部放入新数据，因无消费者而无害——因此这里只检查消费侧。
+     */
+    public boolean isBackgroundStopped() {
+        return !runningFlag
+                && (schedulerThread == null || !schedulerThread.isAlive())
+                && (timeoutScheduler == null || timeoutScheduler.isTerminated())
+                && (workers == null || workers.isShutdown());
+    }
+
+    /** 测试辅助：按尝试序号覆盖某作业的超时预算（不持久化，仅用于精确编排竞争时序）。 */
+    public void setAttemptTimeoutOverride(String jobId, int attempt, long millis) {
+        synchronized (lock) {
+            Job job = jobs.get(jobId);
+            if (job != null) {
+                job.setAttemptTimeoutOverride(attempt, millis);
+            }
+        }
+    }
+
+    /** 撤销某作业当前这次尝试挂着的超时计时任务（若有）。调用前持有锁。 */
+    private void disarmTimeout(String jobId) {
+        ScheduledFuture<?> t = timeoutFutures.remove(jobId);
+        if (t != null) {
+            t.cancel(false);
+        }
+    }
+
+    private record Outcome(String jobId, int attempt, boolean success, String error, boolean interrupted) {
     }
 }

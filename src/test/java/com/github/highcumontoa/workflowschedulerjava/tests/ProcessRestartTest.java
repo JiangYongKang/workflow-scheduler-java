@@ -152,4 +152,29 @@ class ProcessRestartTest {
                 "恢复后 held 应恰好执行一次: " + jobLines.get(1));
         assertEquals(1, attemptLines(out, "held").size(), "held 只执行一次，记录只有一条");
     }
+
+    @Test
+    void timeoutRetryKeepsExactAttemptRecordsAcrossRealKill(@TempDir Path dir) throws Exception {
+        // 第一个进程：第 1 次尝试已判 TIMEOUT（1 条记录），作业处于重试退避窗口时被真实杀掉
+        Proc first = spawn(dir, "run-timeout-retry");
+        first.awaitLine("READY", Duration.ofSeconds(30));
+        first.killForcibly();
+
+        // 第二个进程：从同一目录恢复，第 2 次尝试立即成功（slowOnce 只有第 1 次睡眠）
+        Proc second = spawn(dir, "verify-timeout-retry");
+        List<String> out = second.awaitDoneAndCollect(Duration.ofSeconds(60));
+
+        Map<String, String> jobs = jobStates(out);
+        log.info("[真实重启判定] 超时重试作业恢复后状态: {}", jobs);
+        // 第 1 次 TIMEOUT（杀前已落盘）+ 第 2 次 SUCCESS，重启不虚增、不丢失
+        assertEquals("SUCCESS/2", jobs.get("tjob"), "恢复后应恰好再执行一次并成功: " + jobs);
+
+        List<String> attempts = attemptLines(out, "tjob");
+        log.info("[真实重启判定] tjob 执行记录: {}", attempts);
+        assertEquals(2, attempts.size(), "记录条数必须等于真实尝试次数（杀前 1 + 恢复后 1），不虚增不丢失");
+        assertTrue(attempts.get(0).contains("attempt=1 result=TIMEOUT"),
+                "杀前已判定的 TIMEOUT 记录必须原样保留: " + attempts.get(0));
+        assertTrue(attempts.get(1).contains("attempt=2 result=SUCCESS"),
+                "恢复后的第 2 次尝试成功: " + attempts.get(1));
+    }
 }

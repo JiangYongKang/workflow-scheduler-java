@@ -42,6 +42,13 @@ public class Job {
     /** 单次执行的最长时长（毫秒）；null 或 <=0 表示不限制（保持原有行为）。仅在 RUNNING 期间计时。 */
     private Long timeoutMillis;
 
+    /**
+     * 按尝试序号覆盖的最长执行时长（毫秒），key 为尝试序号（从 1 开始）。仅用于测试精确编排
+     * 各次尝试的超时预算；不持久化、不经过 HTTP 提交。生产路径恒为 null，行为与 timeoutMillis 一致。
+     */
+    @JsonIgnore
+    private transient java.util.Map<Integer, Long> attemptTimeoutOverrides;
+
     /** 当前状态。 */
     private JobState state = JobState.PENDING;
 
@@ -110,6 +117,21 @@ public class Job {
 
     public Long getTimeoutMillis() { return timeoutMillis; }
     public void setTimeoutMillis(Long timeoutMillis) { this.timeoutMillis = timeoutMillis; }
+
+    /** 测试用：按尝试序号读取超时预算覆盖；无覆盖返回 null。 */
+    @JsonIgnore
+    public Long getTimeoutForAttempt(int attempt) {
+        return attemptTimeoutOverrides == null ? null : attemptTimeoutOverrides.get(attempt);
+    }
+
+    /** 测试用：设置按尝试序号的超时预算覆盖。 */
+    @JsonIgnore
+    public void setAttemptTimeoutOverride(int attempt, long millis) {
+        if (attemptTimeoutOverrides == null) {
+            attemptTimeoutOverrides = new java.util.HashMap<>();
+        }
+        attemptTimeoutOverrides.put(attempt, millis);
+    }
 
     public JobState getState() { return state; }
     public void setState(JobState state) { this.state = state; }
